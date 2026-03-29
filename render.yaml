@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: la-cna-accio-bridge
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 5000
+      - key: ACCIO_API_BASE_URL
+        sync: false
+      - key: ACCIO_API_ACCOUNT
+        sync: false
+      - key: ACCIO_API_USERNAME
+        sync: false
+      - key: ACCIO_API_PASSWORD
+        sync: false
+      - key: ACCIO_API_MODE
+        value: PROD
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: MAX_CONCURRENT_LOOKUPS
+        value: 3
+      - key: HTTP_TIMEOUT_SECONDS
+        value: 30
+      - key: MAX_RETRIES
+        value: 3
+    plan: free
