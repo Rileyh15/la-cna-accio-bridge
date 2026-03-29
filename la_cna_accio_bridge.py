@@ -734,7 +734,7 @@ class AccioDataClient:
             f"{self._build_login_xml()}"
             f"<ordernumber>{_xml_escape(order_number)}</ordernumber>"
             f"<suborder>"
-            f"<searchtype>CNA Credential Verification</searchtype>"
+            f"<searchtype>Certified Nurse Aid Registry</searchtype>"
             f"<disposition>{_xml_escape(disposition)}</disposition>"
             f"<comments>LA CNA/DSW Registry lookup completed "
             f"{result.lookup_timestamp}</comments>"
