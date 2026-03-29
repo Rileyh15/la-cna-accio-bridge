@@ -892,8 +892,9 @@ class AccioDataClient:
         suborder_attr = f' number="{_xml_escape(sub_order_number)}"' if sub_order_number else ""
         request_xml = (
             f"<?xml version='1.0' encoding='UTF-8'?>"
-            f"<PostResults>"
+            f"<XML>"
             f"{self._build_login_xml()}"
+            f"<postResults>"
             f"<ordernumber>{_xml_escape(order_number)}</ordernumber>"
             f"<suborder{suborder_attr}>"
             f"<searchtype>Certified Nurse Aid Registry</searchtype>"
@@ -902,7 +903,8 @@ class AccioDataClient:
             f"{result.lookup_timestamp}</comments>"
             f"{verified_items}"
             f"</suborder>"
-            f"</PostResults>"
+            f"</postResults>"
+            f"</XML>"
         )
 
         # Post to Accio's researcher XML endpoint
