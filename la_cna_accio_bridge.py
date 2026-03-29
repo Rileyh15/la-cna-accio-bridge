@@ -52,8 +52,14 @@ ACCIO_API_USERNAME: str = os.environ.get("ACCIO_API_USERNAME", "")
 ACCIO_API_PASSWORD: str = os.environ.get("ACCIO_API_PASSWORD", "")
 ACCIO_API_MODE: str = os.environ.get("ACCIO_API_MODE", "PROD")
 
-# Webhook authentication
+# Webhook authentication (Accio XML credential-based auth)
+# WEBHOOK_SECRET kept for backward compat but no longer required
 WEBHOOK_SECRET: str = os.environ.get("WEBHOOK_SECRET", "")
+
+# Accio PostResults endpoint (defaults to /c/p/researcherxml)
+ACCIO_POSTRESULTS_PATH: str = os.environ.get(
+    "ACCIO_POSTRESULTS_PATH", "/c/p/researcherxml"
+)
 
 # LA CNA Registry
 LA_CNA_URL: str = "https://tlc.dhh.la.gov/frmsearchweb2.aspx"
@@ -70,7 +76,6 @@ _REQUIRED_ENV_VARS = [
     "ACCIO_API_ACCOUNT",
     "ACCIO_API_USERNAME",
     "ACCIO_API_PASSWORD",
-    "WEBHOOK_SECRET",
 ]
 
 
@@ -666,11 +671,15 @@ class AccioDataClient:
         return orders
 
     async def post_verification_result(
-        self, order_number: str, result: CNAResult
+        self, order_number: str, result: CNAResult, sub_order_number: str = ""
     ) -> bool:
         """
         Push CNA verification result back to Accio Data as a completed
         verification suborder. Returns True on success.
+
+        Uses Accio's researcher XML endpoint (PostResults format).
+        The sub_order_number ties the result to the specific search
+        component within the order.
         """
         # Map our status to Accio disposition values
         if result.status == CertificationStatus.CERTIFIED:
@@ -728,12 +737,14 @@ class AccioDataClient:
                 f"</verifieditem>"
             )
 
+        # Build the suborder block — include number if available
+        suborder_attr = f' number="{_xml_escape(sub_order_number)}"' if sub_order_number else ""
         request_xml = (
             f"<?xml version='1.0' encoding='UTF-8'?>"
             f"<PostResults>"
             f"{self._build_login_xml()}"
             f"<ordernumber>{_xml_escape(order_number)}</ordernumber>"
-            f"<suborder>"
+            f"<suborder{suborder_attr}>"
             f"<searchtype>Certified Nurse Aid Registry</searchtype>"
             f"<disposition>{_xml_escape(disposition)}</disposition>"
             f"<comments>LA CNA/DSW Registry lookup completed "
@@ -743,13 +754,19 @@ class AccioDataClient:
             f"</PostResults>"
         )
 
+        # Post to Accio's researcher XML endpoint
+        postresults_url = (
+            f"{self._base_url.rstrip('/')}"
+            f"{ACCIO_POSTRESULTS_PATH}"
+        )
+
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS),
                 verify=True,
             ) as client:
                 response = await client.post(
-                    f"{self._base_url}/xml/postresults",
+                    postresults_url,
                     content=request_xml,
                     headers={"Content-Type": "text/xml"},
                 )
@@ -882,7 +899,7 @@ class CNAVerificationOrchestrator:
         return summary
 
     async def process_single_order(
-        self, order_number: str, raw_ssn: str
+        self, order_number: str, raw_ssn: str, sub_order_number: str = ""
     ) -> dict[str, Any]:
         """
         Process a single order (e.g., triggered by webhook).
@@ -892,6 +909,7 @@ class CNAVerificationOrchestrator:
         """
         response: dict[str, Any] = {
             "order_number": order_number,
+            "sub_order_number": sub_order_number,
             "success": False,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
@@ -909,7 +927,7 @@ class CNAVerificationOrchestrator:
 
             # Push to Accio
             push_ok = await self._accio.post_verification_result(
-                order_number, result
+                order_number, result, sub_order_number
             )
 
             response.update({
@@ -966,54 +984,83 @@ def create_app() -> "FastAPI":
     orchestrator = CNAVerificationOrchestrator()
 
     @app.post("/webhook/accio/cna-verify")
-    async def webhook_cna_verify(request: Request) -> JSONResponse:
+    async def webhook_cna_verify(request: Request) -> Response:
         """
-        Webhook endpoint triggered by Accio Data when a CNA verification
-        is needed. Expects JSON body with order_number and ssn.
+        Vendor endpoint called by Accio Data when dispatching a CNA
+        verification order.  Accepts the standard Accio XML vendor
+        dispatch format (<AccioOrder>) and returns XML.
 
-        Authentication: HMAC-SHA256 signature in X-Webhook-Signature header.
+        Authentication: Accio XML <login> credentials validated against
+        environment variables.
         """
-        # ── Verify webhook signature ──
-        signature = request.headers.get("X-Webhook-Signature", "")
         body = await request.body()
 
-        if not _verify_webhook_signature(body, signature):
-            raise HTTPException(status_code=401, detail="Invalid signature")
-
-        # ── Parse request (SSN enters memory here) ──
+        # ── Parse the incoming Accio XML ──
         try:
-            import json
-            payload = json.loads(body)
-            order_number = payload.get("order_number", "").strip()
-            raw_ssn = payload.get("ssn", "").strip()
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload")
+            root = ET.fromstring(body)
+        except ET.ParseError:
+            return _xml_error_response("400", "Malformed XML")
+
+        # ── Verify Accio credentials ──
+        login = root.find("login")
+        if login is None:
+            return _xml_error_response("401", "Missing login block")
+
+        incoming_account = (login.findtext("account") or "").strip()
+        incoming_username = (login.findtext("username") or "").strip()
+        incoming_password = (login.findtext("password") or "").strip()
+
+        if not _verify_accio_credentials(
+            incoming_account, incoming_username, incoming_password
+        ):
+            return _xml_error_response("401", "Invalid credentials")
+
+        # Zero password from memory immediately
+        _secure_zero_string(incoming_password)
+        del incoming_password
+        gc.collect()
+
+        # ── Extract order data ──
+        place_order = root.find(".//placeOrder")
+        if place_order is None:
+            return _xml_error_response("400", "Missing placeOrder element")
+
+        order_number = place_order.get("number", "").strip()
+        sub_order = place_order.find("subOrder")
+        sub_order_number = sub_order.get("number", "").strip() if sub_order is not None else ""
+
+        # ── Extract SSN from subject (SSN enters memory here) ──
+        subject = place_order.find("subject")
+        if subject is None:
+            return _xml_error_response("400", "Missing subject element")
+
+        raw_ssn = (subject.findtext("ssn") or "").strip()
+        name_first = (subject.findtext("name_first") or "").strip()
+        name_last = (subject.findtext("name_last") or "").strip()
 
         if not order_number or not raw_ssn:
-            raise HTTPException(
-                status_code=400,
-                detail="Missing order_number or ssn",
-            )
+            return _xml_error_response("400", "Missing order number or SSN")
 
-        # ── Zero the raw body and payload immediately ──
-        _secure_zero_string(raw_ssn)
-        # Re-extract for processing (the SSN is still in payload)
-        raw_ssn = payload.get("ssn", "")
-        payload["ssn"] = "\x00" * len(raw_ssn) if raw_ssn else ""
-        del payload
+        # ── Zero the SSN in the parsed XML immediately ──
+        ssn_elem = subject.find("ssn")
+        if ssn_elem is not None:
+            ssn_elem.text = "\x00" * 9
         del body
         gc.collect()
 
         # ── Process the lookup ──
-        result = await orchestrator.process_single_order(order_number, raw_ssn)
+        result = await orchestrator.process_single_order(
+            order_number, raw_ssn, sub_order_number
+        )
 
         # Zero raw_ssn one more time (belt and suspenders)
         _secure_zero_string(raw_ssn)
         del raw_ssn
         gc.collect()
 
-        status_code = 200 if result.get("success") else 502
-        return JSONResponse(content=result, status_code=status_code)
+        # ── Return XML acknowledgment to Accio ──
+        success = result.get("success", False)
+        return _xml_ack_response(order_number, sub_order_number, success)
 
     @app.post("/webhook/accio/batch-verify")
     async def webhook_batch_verify(request: Request) -> JSONResponse:
@@ -1021,13 +1068,14 @@ def create_app() -> "FastAPI":
         Trigger a batch verification run that pulls all pending orders
         from Accio and processes them.
 
-        Authentication: HMAC-SHA256 signature in X-Webhook-Signature header.
+        Authentication: HMAC-SHA256 signature in X-Webhook-Signature header
+        (optional — skipped if WEBHOOK_SECRET is not set).
         """
-        signature = request.headers.get("X-Webhook-Signature", "")
-        body = await request.body()
-
-        if not _verify_webhook_signature(body, signature):
-            raise HTTPException(status_code=401, detail="Invalid signature")
+        if WEBHOOK_SECRET:
+            signature = request.headers.get("X-Webhook-Signature", "")
+            body = await request.body()
+            if not _verify_webhook_signature(body, signature):
+                raise HTTPException(status_code=401, detail="Invalid signature")
 
         summary = await orchestrator.process_pending_orders()
         return JSONResponse(content=summary, status_code=200)
@@ -1052,10 +1100,10 @@ def create_app() -> "FastAPI":
             ACCIO_API_BASE_URL, ACCIO_API_ACCOUNT,
             ACCIO_API_USERNAME, ACCIO_API_PASSWORD,
         ])
-        webhook_configured = bool(WEBHOOK_SECRET)
+        webhook_configured = accio_configured  # XML credential auth uses Accio creds
         accio_status = "Connected" if accio_configured else "Awaiting Credentials"
         accio_dot = "#10b981" if accio_configured else "#f59e0b"
-        webhook_status = "Active" if webhook_configured else "Not Configured"
+        webhook_status = "XML Credential Auth" if webhook_configured else "Not Configured"
         webhook_dot = "#10b981" if webhook_configured else "#ef4444"
         registry_status = "Reachable"
         registry_dot = "#10b981"
@@ -1207,7 +1255,7 @@ def create_app() -> "FastAPI":
       </div>
       <div class="card">
         <div class="card-title">Security Posture</div>
-        <div class="security-item"><span class="check">&check;</span> HMAC-SHA256 webhook authentication</div>
+        <div class="security-item"><span class="check">&check;</span> Accio XML credential authentication</div>
         <div class="security-item"><span class="check">&check;</span> SSNs exist only in RAM during lookup</div>
         <div class="security-item"><span class="check">&check;</span> Triple-layer memory zeroing + forced GC</div>
         <div class="security-item"><span class="check">&check;</span> Zero PII in logs, disk, or cache</div>
@@ -1243,7 +1291,7 @@ def _xml_escape(text: str) -> str:
 
 
 def _verify_webhook_signature(body: bytes, signature: str) -> bool:
-    """Verify HMAC-SHA256 webhook signature."""
+    """Verify HMAC-SHA256 webhook signature (for batch endpoint)."""
     if not WEBHOOK_SECRET or not signature:
         return False
     expected = hmac.new(
@@ -1252,6 +1300,54 @@ def _verify_webhook_signature(body: bytes, signature: str) -> bool:
         hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
+
+
+def _verify_accio_credentials(
+    account: str, username: str, password: str
+) -> bool:
+    """
+    Verify incoming Accio XML credentials against configured env vars.
+    Uses constant-time comparison to prevent timing attacks.
+    """
+    if not account or not username or not password:
+        return False
+    account_ok = hmac.compare_digest(account, ACCIO_API_ACCOUNT)
+    username_ok = hmac.compare_digest(username, ACCIO_API_USERNAME)
+    password_ok = hmac.compare_digest(password, ACCIO_API_PASSWORD)
+    return account_ok and username_ok and password_ok
+
+
+def _xml_error_response(code: str, message: str) -> "Response":
+    """Build an XML error response that Accio can parse."""
+    from fastapi import Response as _Resp
+    xml_body = (
+        f"<?xml version='1.0' encoding='UTF-8'?>"
+        f"<VendorResponse>"
+        f"<status>error</status>"
+        f"<errorcode>{_xml_escape(code)}</errorcode>"
+        f"<errormessage>{_xml_escape(message)}</errormessage>"
+        f"</VendorResponse>"
+    )
+    status = int(code) if code.isdigit() and 100 <= int(code) < 600 else 400
+    return _Resp(content=xml_body, media_type="text/xml", status_code=status)
+
+
+def _xml_ack_response(
+    order_number: str, sub_order_number: str, success: bool
+) -> "Response":
+    """Build an XML acknowledgment response for Accio."""
+    from fastapi import Response as _Resp
+    status_text = "received" if success else "processing_error"
+    xml_body = (
+        f"<?xml version='1.0' encoding='UTF-8'?>"
+        f"<VendorResponse>"
+        f"<status>{status_text}</status>"
+        f"<errorcode>0</errorcode>"
+        f"<ordernumber>{_xml_escape(order_number)}</ordernumber>"
+        f"<subordernumber>{_xml_escape(sub_order_number)}</subordernumber>"
+        f"</VendorResponse>"
+    )
+    return _Resp(content=xml_body, media_type="text/xml", status_code=200)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
