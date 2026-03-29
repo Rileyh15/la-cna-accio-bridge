@@ -1376,6 +1376,9 @@ def create_app() -> "FastAPI":
     <h1>LA CNA Registry Bridge</h1>
     <div class="subtitle">Louisiana CNA/DSW Registry &harr; Accio Data Integration</div>
     <span class="badge">System Online</span>
+    <a href="/orders" style="display:inline-block;margin-top:0.8rem;padding:0.5rem 1.5rem;
+       background:#3b82f6;color:#fff;border-radius:6px;text-decoration:none;font-weight:600;
+       font-size:0.95rem;transition:background 0.2s;">Order Tracker &rarr;</a>
   </div>
   <div class="container">
     <div class="grid">
