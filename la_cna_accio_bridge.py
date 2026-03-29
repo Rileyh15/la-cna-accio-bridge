@@ -893,8 +893,8 @@ class AccioDataClient:
         request_xml = (
             f"<?xml version='1.0' encoding='UTF-8'?>"
             f"<XML>"
-            f"{self._build_login_xml()}"
             f"<postResults>"
+            f"{self._build_login_xml()}"
             f"<ordernumber>{_xml_escape(order_number)}</ordernumber>"
             f"<suborder{suborder_attr}>"
             f"<searchtype>Certified Nurse Aid Registry</searchtype>"
@@ -1697,30 +1697,44 @@ def _xml_error_response(code: str, message: str) -> "Response":
     from fastapi import Response as _Resp
     xml_body = (
         f"<?xml version='1.0' encoding='UTF-8'?>"
-        f"<VendorResponse>"
-        f"<status>error</status>"
+        f"<XML>"
+        f"<error>"
         f"<errorcode>{_xml_escape(code)}</errorcode>"
-        f"<errormessage>{_xml_escape(message)}</errormessage>"
-        f"</VendorResponse>"
+        f"<errortext>{_xml_escape(message)}</errortext>"
+        f"</error>"
+        f"</XML>"
     )
-    status = int(code) if code.isdigit() and 100 <= int(code) < 600 else 400
-    return _Resp(content=xml_body, media_type="text/xml", status_code=status)
+    return _Resp(content=xml_body, media_type="text/xml", status_code=200)
 
 
 def _xml_ack_response(
     order_number: str, sub_order_number: str, success: bool
 ) -> "Response":
-    """Build an XML acknowledgment response for Accio."""
+    """
+    Build an XML acknowledgment response for Accio vendor dispatch.
+
+    Accio requires an <order> node in the response to confirm the vendor
+    accepted the order. Without it, Accio shows:
+    "The response document has no order node to indicate fulfillment."
+    """
     from fastapi import Response as _Resp
-    status_text = "received" if success else "processing_error"
+    error_code = "0" if success else "1"
+    error_text = "" if success else "Processing error"
+    suborder_node = (
+        f'<suborder number="{_xml_escape(sub_order_number)}"/>'
+        if sub_order_number else ""
+    )
     xml_body = (
         f"<?xml version='1.0' encoding='UTF-8'?>"
-        f"<VendorResponse>"
-        f"<status>{status_text}</status>"
-        f"<errorcode>0</errorcode>"
-        f"<ordernumber>{_xml_escape(order_number)}</ordernumber>"
-        f"<subordernumber>{_xml_escape(sub_order_number)}</subordernumber>"
-        f"</VendorResponse>"
+        f"<XML>"
+        f"<order number=\"{_xml_escape(order_number)}\">"
+        f"<error>"
+        f"<errorcode>{error_code}</errorcode>"
+        f"<errortext>{_xml_escape(error_text)}</errortext>"
+        f"</error>"
+        f"{suborder_node}"
+        f"</order>"
+        f"</XML>"
     )
     return _Resp(content=xml_body, media_type="text/xml", status_code=200)
 
