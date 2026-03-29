@@ -619,7 +619,7 @@ class AccioDataClient:
         )
 
     async def fetch_pending_orders(self) -> list[dict[str, str]]:
-    """
+        """
         Retrieve orders from Accio that need CNA verification.
 
         Returns list of dicts with keys: order_number, ssn
