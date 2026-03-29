@@ -1448,11 +1448,11 @@ def create_app() -> "FastAPI":
         counters = summary["counters"]
         orders = order_tracker.get_all_orders()
 
-        # Build table rows
+        # Build table rows — simple: order #, status, completed date/time
         rows_html = ""
         if not orders:
             rows_html = (
-                '<tr><td colspan="7" style="text-align:center;'
+                '<tr><td colspan="3" style="text-align:center;'
                 'color:#94a3b8;padding:2rem;">No orders tracked yet. '
                 'Orders appear here when Accio dispatches to the bridge.'
                 '</td></tr>'
@@ -1460,46 +1460,33 @@ def create_app() -> "FastAPI":
         else:
             for o in orders:
                 status = o.get("status", "unknown")
-                # Color-code status
                 if status == "completed":
                     badge_color = "#10b981"
+                    badge_text = "Complete"
                 elif status == "failed":
                     badge_color = "#ef4444"
+                    badge_text = "Failed"
                 elif status in ("processing", "lookup_complete", "posting_results"):
                     badge_color = "#f59e0b"
+                    badge_text = "Processing"
                 else:
-                    badge_color = "#6b7280"
+                    badge_color = "#3b82f6"
+                    badge_text = "Received"
 
-                disp = o.get("disposition") or "—"
-                disp_color = "#10b981" if disp in ("Verified", "certified") else (
-                    "#ef4444" if disp in ("Unable to Verify", "not_certified") else (
-                        "#f59e0b" if disp in ("No Match", "not_found", "See Comments") else "#94a3b8"
-                    )
-                )
-
-                received = (o.get("received_at") or "")[:19].replace("T", " ")
-                completed = (o.get("completed_at") or "")[:19].replace("T", " ")
-                duration = o.get("duration_ms")
-                dur_str = f"{duration}ms" if duration else "—"
-                push = o.get("push_success")
-                push_str = "Yes" if push is True else ("No" if push is False else "—")
-                push_color = "#10b981" if push is True else (
-                    "#ef4444" if push is False else "#94a3b8"
-                )
-                err = o.get("error") or ""
+                # Show completed_at if done, otherwise received_at
+                completed = o.get("completed_at") or ""
+                received = o.get("received_at") or ""
+                timestamp = completed if completed else received
+                timestamp_display = timestamp[:19].replace("T", " ") if timestamp else "—"
 
                 rows_html += (
                     f'<tr>'
-                    f'<td>{_xml_escape(o.get("order_number", ""))}</td>'
-                    f'<td>{_xml_escape(o.get("sub_order_number", ""))}</td>'
+                    f'<td style="font-weight:600;">'
+                    f'{_xml_escape(o.get("order_number", ""))}</td>'
                     f'<td><span style="background:{badge_color};color:#fff;'
-                    f'padding:2px 8px;border-radius:4px;font-size:0.8rem;">'
-                    f'{_xml_escape(status)}</span></td>'
-                    f'<td style="color:{disp_color};">{_xml_escape(disp)}</td>'
-                    f'<td style="color:{push_color};">{push_str}</td>'
-                    f'<td>{dur_str}</td>'
-                    f'<td style="font-size:0.8rem;color:#94a3b8;">'
-                    f'{received}</td>'
+                    f'padding:3px 12px;border-radius:4px;font-size:0.85rem;">'
+                    f'{badge_text}</span></td>'
+                    f'<td style="color:#94a3b8;">{timestamp_display}</td>'
                     f'</tr>'
                 )
 
@@ -1524,11 +1511,11 @@ def create_app() -> "FastAPI":
   .num-received {{ color:#3b82f6; }}
   .num-completed {{ color:#10b981; }}
   .num-failed {{ color:#ef4444; }}
-  table {{ width:100%; border-collapse:collapse; background:#1e293b;
-           border:1px solid #334155; border-radius:8px; overflow:hidden; }}
-  th {{ background:#334155; padding:0.7rem; text-align:left; font-size:0.85rem;
+  table {{ width:100%; max-width:700px; margin:0 auto; border-collapse:collapse;
+           background:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden; }}
+  th {{ background:#334155; padding:0.8rem 1rem; text-align:left; font-size:0.85rem;
         color:#94a3b8; text-transform:uppercase; letter-spacing:0.05em; }}
-  td {{ padding:0.6rem 0.7rem; border-bottom:1px solid #1e293b; font-size:0.9rem; }}
+  td {{ padding:0.7rem 1rem; border-bottom:1px solid #293548; font-size:0.95rem; }}
   tr:hover {{ background:#334155; }}
   .refresh {{ text-align:center; color:#64748b; font-size:0.75rem; margin-top:1rem; }}
   a {{ color:#3b82f6; text-decoration:none; }}
@@ -1537,15 +1524,14 @@ def create_app() -> "FastAPI":
 </style>
 </head>
 <body>
-  <div class="nav"><a href="/">&larr; Dashboard</a> &nbsp;|&nbsp;
-  <a href="/orders/json">JSON API</a></div>
+  <div class="nav"><a href="/">&larr; Dashboard</a></div>
   <h1>Order Tracker</h1>
-  <p class="subtitle">Zero-PII order lifecycle tracking &mdash; auto-refreshes every 10s</p>
+  <p class="subtitle">Auto-refreshes every 10 seconds</p>
 
   <div class="counters">
     <div class="counter">
       <div class="num num-received">{counters.get("total_received", 0)}</div>
-      <div class="lbl">Total Received</div>
+      <div class="lbl">Received</div>
     </div>
     <div class="counter">
       <div class="num num-completed">{counters.get("total_completed", 0)}</div>
@@ -1555,22 +1541,14 @@ def create_app() -> "FastAPI":
       <div class="num num-failed">{counters.get("total_failed", 0)}</div>
       <div class="lbl">Failed</div>
     </div>
-    <div class="counter">
-      <div class="num" style="color:#f59e0b;">{summary.get("in_memory_count", 0)}</div>
-      <div class="lbl">In Memory</div>
-    </div>
   </div>
 
   <table>
     <thead>
       <tr>
         <th>Order #</th>
-        <th>SubOrder #</th>
         <th>Status</th>
-        <th>Disposition</th>
-        <th>Pushed to Accio</th>
-        <th>Duration</th>
-        <th>Received At (UTC)</th>
+        <th>Date / Time (UTC)</th>
       </tr>
     </thead>
     <tbody>
