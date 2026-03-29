@@ -65,6 +65,13 @@ ACCIO_VENDOR_PASSWORD: str = os.environ.get(
 # WEBHOOK_SECRET kept for backward compat but no longer required
 WEBHOOK_SECRET: str = os.environ.get("WEBHOOK_SECRET", "")
 
+# Accio XML Vendor Registration (required since Aug 2025)
+# Register at https://www.acciodata.com/vendorxml/ to get an access key
+ACCIO_REGISTRATION_KEY: str = os.environ.get("ACCIO_REGISTRATION_KEY", "")
+ACCIO_REGISTRATION_COMPANY: str = os.environ.get(
+    "ACCIO_REGISTRATION_COMPANY", ""
+)
+
 # Accio PostResults endpoint (defaults to /c/p/researcherxml)
 ACCIO_POSTRESULTS_PATH: str = os.environ.get(
     "ACCIO_POSTRESULTS_PATH", "/c/p/researcherxml"
@@ -774,6 +781,23 @@ class AccioDataClient:
             f"</login>"
         )
 
+    def _build_registration_xml(self) -> str:
+        """Build the <registration> block required by Accio since Aug 2025."""
+        if not ACCIO_REGISTRATION_KEY:
+            return ""
+        return (
+            f"<registration>"
+            f"<Company>{_xml_escape(ACCIO_REGISTRATION_COMPANY or 'LA CNA Bridge')}</Company>"
+            f"<version>1.0.0</version>"
+            f"<last_changed_date>{datetime.now(timezone.utc).strftime('%Y%m%d')}</last_changed_date>"
+            f"<access_key>{_xml_escape(ACCIO_REGISTRATION_KEY)}</access_key>"
+            f"<contacts>"
+            f"<business><name/><phone_number/><email/></business>"
+            f"<technical><name/><phone_number/><email/></technical>"
+            f"</contacts>"
+            f"</registration>"
+        )
+
     async def fetch_pending_orders(self) -> list[dict[str, str]]:
         """
         Retrieve orders from Accio that need CNA verification.
@@ -890,11 +914,16 @@ class AccioDataClient:
 
         # Build the suborder block — include number if available
         suborder_attr = f' number="{_xml_escape(sub_order_number)}"' if sub_order_number else ""
+
+        # Accio requires <ScreeningResults> as root with <login> and
+        # <registration> as siblings of <postResults> (NOT inside it).
+        # Registration block is mandatory since August 2025.
         request_xml = (
             f"<?xml version='1.0' encoding='UTF-8'?>"
-            f"<XML>"
-            f"<postResults>"
+            f"<ScreeningResults>"
             f"{self._build_login_xml()}"
+            f"{self._build_registration_xml()}"
+            f"<postResults>"
             f"<ordernumber>{_xml_escape(order_number)}</ordernumber>"
             f"<suborder{suborder_attr}>"
             f"<searchtype>Certified Nurse Aid Registry</searchtype>"
@@ -904,7 +933,7 @@ class AccioDataClient:
             f"{verified_items}"
             f"</suborder>"
             f"</postResults>"
-            f"</XML>"
+            f"</ScreeningResults>"
         )
 
         # Post to Accio's researcher XML endpoint
@@ -931,7 +960,7 @@ class AccioDataClient:
                 "sub_order_number": sub_order_number,
                 "url": postresults_url,
                 "http_status": response.status_code,
-                "response_body": response.text[:500],
+                "response_body": response.text[:1500],
                 "disposition": disposition,
                 "success": False,
                 "error": None,
@@ -939,7 +968,7 @@ class AccioDataClient:
 
             print(f"[PostResults] URL: {postresults_url}")
             print(f"[PostResults] HTTP {response.status_code}")
-            print(f"[PostResults] Response: {response.text[:500]}")
+            print(f"[PostResults] Response: {response.text[:1500]}")
 
             if response.status_code >= 400:
                 log_entry["error"] = f"HTTP {response.status_code}"
@@ -949,15 +978,38 @@ class AccioDataClient:
             # Check for success in response
             try:
                 root = ET.fromstring(response.text)
+
+                # Accio may return errors in two formats:
+                #  1) <errorcode>N</errorcode> (classic)
+                #  2) <error n="N">text</error> (newer format)
                 error_code = root.findtext(".//errorcode", "").strip()
                 error_msg = root.findtext(".//errormessage", "").strip()
+
+                # Also check for <error n="..."> attribute-style errors
+                error_elem = root.find(".//error")
+                if error_elem is not None:
+                    attr_n = error_elem.get("n", "").strip()
+                    if attr_n and attr_n != "0":
+                        error_text = (error_elem.text or "").strip()
+                        log_entry["error"] = f"Accio error n={attr_n}: {error_text}"
+                        _log_postresult(log_entry)
+                        return False
+
                 if error_code and error_code != "0":
                     log_entry["error"] = f"Accio error {error_code}: {error_msg}"
                     _log_postresult(log_entry)
                     return False
+
+                # Check for warnings (not fatal but logged)
+                warning_elem = root.find(".//warning")
+                if warning_elem is not None:
+                    warn_text = (warning_elem.findtext("text") or warning_elem.text or "").strip()
+                    if warn_text:
+                        log_entry["warning"] = warn_text[:300]
+
                 log_entry["success"] = True
                 _log_postresult(log_entry)
-                return error_code == "0" or "success" in response.text.lower()
+                return True
             except ET.ParseError:
                 log_entry["error"] = f"Non-XML response: {response.text[:200]}"
                 log_entry["success"] = response.status_code == 200
@@ -1339,6 +1391,9 @@ def create_app() -> "FastAPI":
         accio_dot = "#10b981" if accio_configured else "#f59e0b"
         webhook_status = "XML Credential Auth" if webhook_configured else "Not Configured"
         webhook_dot = "#10b981" if webhook_configured else "#ef4444"
+        registration_configured = bool(ACCIO_REGISTRATION_KEY)
+        registration_status = "Registered" if registration_configured else "Not Registered — register at acciodata.com/vendorxml/"
+        registration_dot = "#10b981" if registration_configured else "#ef4444"
         registry_status = "Reachable"
         registry_dot = "#10b981"
 
@@ -1450,6 +1505,10 @@ def create_app() -> "FastAPI":
         <div class="status-row">
           <span class="status-label">Webhook Auth</span>
           <span class="status-value"><span class="dot" style="background:{webhook_dot}"></span> {webhook_status}</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">XML Registration</span>
+          <span class="status-value"><span class="dot" style="background:{registration_dot}"></span> {registration_status}</span>
         </div>
         <div class="status-row">
           <span class="status-label">LA CNA Registry</span>
