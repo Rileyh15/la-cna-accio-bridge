@@ -228,6 +228,17 @@ class OrderTracker:
 # Global tracker instance (shared across webhook and orchestrator)
 order_tracker = OrderTracker()
 
+# PostResults diagnostic log (last N attempts, no PII)
+_postresults_log: list[dict[str, Any]] = []
+_POSTRESULTS_LOG_MAX = 20
+
+
+def _log_postresult(entry: dict[str, Any]) -> None:
+    """Append a PostResults diagnostic entry (thread-safe via GIL)."""
+    _postresults_log.append(entry)
+    while len(_postresults_log) > _POSTRESULTS_LOG_MAX:
+        _postresults_log.pop(0)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 2: SECURE MEMORY HANDLING  (the SSN fortress)
@@ -910,14 +921,60 @@ class AccioDataClient:
                     content=request_xml,
                     headers={"Content-Type": "text/xml"},
                 )
-                response.raise_for_status()
+
+            # Log the response for debugging (no PII in PostResults response)
+            log_entry: dict[str, Any] = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "order_number": order_number,
+                "sub_order_number": sub_order_number,
+                "url": postresults_url,
+                "http_status": response.status_code,
+                "response_body": response.text[:500],
+                "disposition": disposition,
+                "success": False,
+                "error": None,
+            }
+
+            print(f"[PostResults] URL: {postresults_url}")
+            print(f"[PostResults] HTTP {response.status_code}")
+            print(f"[PostResults] Response: {response.text[:500]}")
+
+            if response.status_code >= 400:
+                log_entry["error"] = f"HTTP {response.status_code}"
+                _log_postresult(log_entry)
+                return False
 
             # Check for success in response
-            root = ET.fromstring(response.text)
-            error_code = root.findtext(".//errorcode", "").strip()
-            return error_code == "0" or "success" in response.text.lower()
+            try:
+                root = ET.fromstring(response.text)
+                error_code = root.findtext(".//errorcode", "").strip()
+                error_msg = root.findtext(".//errormessage", "").strip()
+                if error_code and error_code != "0":
+                    log_entry["error"] = f"Accio error {error_code}: {error_msg}"
+                    _log_postresult(log_entry)
+                    return False
+                log_entry["success"] = True
+                _log_postresult(log_entry)
+                return error_code == "0" or "success" in response.text.lower()
+            except ET.ParseError:
+                log_entry["error"] = f"Non-XML response: {response.text[:200]}"
+                log_entry["success"] = response.status_code == 200
+                _log_postresult(log_entry)
+                return response.status_code == 200
 
-        except Exception:
+        except Exception as exc:
+            _log_postresult({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "order_number": order_number,
+                "sub_order_number": sub_order_number,
+                "url": postresults_url,
+                "http_status": None,
+                "response_body": None,
+                "disposition": disposition,
+                "success": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            print(f"[PostResults] EXCEPTION: {type(exc).__name__}: {exc}")
             return False
 
 
@@ -1453,6 +1510,14 @@ def create_app() -> "FastAPI":
     async def orders_json() -> JSONResponse:
         """Return all tracked orders as JSON. Zero PII."""
         return JSONResponse(content=order_tracker.get_summary(), status_code=200)
+
+    @app.get("/debug/postresults")
+    async def debug_postresults() -> JSONResponse:
+        """Show recent PostResults attempts for debugging. Zero PII."""
+        return JSONResponse(content={
+            "postresults_log": list(_postresults_log),
+            "count": len(_postresults_log),
+        }, status_code=200)
 
     @app.get("/orders", response_class=HTMLResponse)
     async def orders_dashboard() -> HTMLResponse:
