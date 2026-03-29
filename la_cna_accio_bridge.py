@@ -45,12 +45,21 @@ import httpx
 # SECTION 1: CONFIGURATION  (all secrets from environment variables)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Accio Data API configuration
+# Accio Data API configuration (Researcher account — for posting results TO Accio)
 ACCIO_API_BASE_URL: str = os.environ.get("ACCIO_API_BASE_URL", "")
 ACCIO_API_ACCOUNT: str = os.environ.get("ACCIO_API_ACCOUNT", "")
 ACCIO_API_USERNAME: str = os.environ.get("ACCIO_API_USERNAME", "")
 ACCIO_API_PASSWORD: str = os.environ.get("ACCIO_API_PASSWORD", "")
 ACCIO_API_MODE: str = os.environ.get("ACCIO_API_MODE", "PROD")
+
+# Accio Vendor Dispatch credentials (what Accio SENDS to our webhook)
+# Falls back to API credentials if not set separately
+ACCIO_VENDOR_USERNAME: str = os.environ.get(
+    "ACCIO_VENDOR_USERNAME", ""
+) or os.environ.get("ACCIO_API_USERNAME", "")
+ACCIO_VENDOR_PASSWORD: str = os.environ.get(
+    "ACCIO_VENDOR_PASSWORD", ""
+) or os.environ.get("ACCIO_API_PASSWORD", "")
 
 # Webhook authentication (Accio XML credential-based auth)
 # WEBHOOK_SECRET kept for backward compat but no longer required
@@ -1264,7 +1273,9 @@ def create_app() -> "FastAPI":
             ACCIO_API_BASE_URL, ACCIO_API_ACCOUNT,
             ACCIO_API_USERNAME, ACCIO_API_PASSWORD,
         ])
-        webhook_configured = accio_configured  # XML credential auth uses Accio creds
+        webhook_configured = all([
+            ACCIO_API_ACCOUNT, ACCIO_VENDOR_USERNAME, ACCIO_VENDOR_PASSWORD,
+        ])
         accio_status = "Connected" if accio_configured else "Awaiting Credentials"
         accio_dot = "#10b981" if accio_configured else "#f59e0b"
         webhook_status = "XML Credential Auth" if webhook_configured else "Not Configured"
@@ -1597,14 +1608,17 @@ def _verify_accio_credentials(
     account: str, username: str, password: str
 ) -> bool:
     """
-    Verify incoming Accio XML credentials against configured env vars.
+    Verify incoming Accio XML vendor dispatch credentials.
+    Uses ACCIO_VENDOR_USERNAME/PASSWORD (what Accio sends TO us),
+    which may differ from the Researcher API credentials used to
+    post results back.
     Uses constant-time comparison to prevent timing attacks.
     """
     if not account or not username or not password:
         return False
     account_ok = hmac.compare_digest(account, ACCIO_API_ACCOUNT)
-    username_ok = hmac.compare_digest(username, ACCIO_API_USERNAME)
-    password_ok = hmac.compare_digest(password, ACCIO_API_PASSWORD)
+    username_ok = hmac.compare_digest(username, ACCIO_VENDOR_USERNAME)
+    password_ok = hmac.compare_digest(password, ACCIO_VENDOR_PASSWORD)
     return account_ok and username_ok and password_ok
 
 
