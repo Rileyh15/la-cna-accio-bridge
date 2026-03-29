@@ -857,16 +857,23 @@ class AccioDataClient:
         component within the order.
         """
         # Map our status to Accio disposition values
+        # filledStatus = high-level status for the postResults attribute
+        # filledCode = more specific code for the postResults attribute
         if result.status == CertificationStatus.CERTIFIED:
-            disposition = "Verified"
+            disposition = "filled"
+            filled_code = "clear"
         elif result.status == CertificationStatus.NOT_CERTIFIED:
-            disposition = "Unable to Verify"
+            disposition = "filled"
+            filled_code = "hits"
         elif result.status == CertificationStatus.CALL_REGISTRY:
-            disposition = "See Comments"
+            disposition = "filled"
+            filled_code = "see comments"
         elif result.status == CertificationStatus.NOT_FOUND:
-            disposition = "No Match"
+            disposition = "filled"
+            filled_code = "see comments"
         else:
-            disposition = "Unable to Verify"
+            disposition = "filled"
+            filled_code = "see comments"
 
         # Build verified item fields
         verified_items = (
@@ -912,26 +919,40 @@ class AccioDataClient:
                 f"</verifieditem>"
             )
 
-        # Build the suborder block — include number if available
-        suborder_attr = f' number="{_xml_escape(sub_order_number)}"' if sub_order_number else ""
+        # Build the note text with all verification details
+        note_parts = [
+            f"CNA Status: {result.status.value}",
+            f"Name: {result.name}" if result.name else None,
+            f"Cert #: {result.certification_number}" if result.certification_number else None,
+            f"Certified From: {result.certified_from}" if result.certified_from else None,
+            f"Certified To: {result.certified_to}" if result.certified_to else None,
+            f"Original Cert Date: {result.original_certification_date}" if result.original_certification_date else None,
+            f"Retest Required By: {result.retest_required_by}" if result.retest_required_by else None,
+            f"Multiple Matches: Yes ({result.match_count} records)" if result.multiple_matches else None,
+            f"Lookup completed {result.lookup_timestamp}",
+        ]
+        note_text = "; ".join(p for p in note_parts if p)
 
-        # Accio requires <ScreeningResults> as root with <login> and
+        # Accio requires <ScreeningResults> as root with <mode>, <login>,
         # <registration> as siblings of <postResults> (NOT inside it).
         # Registration block is mandatory since August 2025.
+        # Format matches working Fingerprint Release Manager integration.
         request_xml = (
             f"<?xml version='1.0' encoding='UTF-8'?>"
             f"<ScreeningResults>"
+            f"<mode>{_xml_escape(ACCIO_API_MODE)}</mode>"
             f"{self._build_login_xml()}"
             f"{self._build_registration_xml()}"
             f"<postResults order=\"{_xml_escape(order_number)}\""
-            f" subOrder=\"{_xml_escape(sub_order_number)}\">"
-            f"<suborder{suborder_attr}>"
-            f"<searchtype>Certified Nurse Aid Registry</searchtype>"
-            f"<disposition>{_xml_escape(disposition)}</disposition>"
-            f"<comments>LA CNA/DSW Registry lookup completed "
-            f"{result.lookup_timestamp}</comments>"
+            f" subOrder=\"{_xml_escape(sub_order_number)}\""
+            f" type=\"Certified Nurse Aid Registry\""
+            f" filledStatus=\"{_xml_escape(disposition)}\""
+            f" filledCode=\"{_xml_escape(filled_code)}\">"
+            f"<notes_from_vendor_to_screeningfirm>"
+            f"{_xml_escape(note_text)}"
+            f"</notes_from_vendor_to_screeningfirm>"
+            f"<text>{_xml_escape(note_text)}</text>"
             f"{verified_items}"
-            f"</suborder>"
             f"</postResults>"
             f"</ScreeningResults>"
         )
@@ -962,6 +983,8 @@ class AccioDataClient:
                 "http_status": response.status_code,
                 "response_body": response.text[:1500],
                 "disposition": disposition,
+                "filled_code": filled_code,
+                "cna_status": result.status.value,
                 "success": False,
                 "error": None,
             }
