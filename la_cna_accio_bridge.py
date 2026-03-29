@@ -90,6 +90,137 @@ def _validate_config() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 1b: ORDER TRACKER  (zero-PII order lifecycle tracking)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+import threading
+
+
+class OrderTracker:
+    """
+    Thread-safe, in-memory order lifecycle tracker.
+
+    Tracks every order through the pipeline WITHOUT storing ANY PII:
+      - No SSNs, no names, no DOBs, no addresses
+      - Only order numbers, timestamps, statuses, and dispositions
+
+    Lifecycle states:
+      received → processing → lookup_complete → posting_results → completed
+      Any stage can transition to → failed
+
+    NOTE: Data lives in RAM only. A service restart clears all tracking.
+    For persistent tracking, wire up a database or external store.
+    """
+
+    # Status constants
+    RECEIVED = "received"
+    PROCESSING = "processing"
+    LOOKUP_COMPLETE = "lookup_complete"
+    POSTING_RESULTS = "posting_results"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+    def __init__(self, max_history: int = 500) -> None:
+        self._lock = threading.Lock()
+        self._orders: dict[str, dict[str, Any]] = {}
+        self._order_list: list[str] = []  # insertion order
+        self._max_history = max_history
+        self._counters = {
+            "total_received": 0,
+            "total_completed": 0,
+            "total_failed": 0,
+        }
+
+    def record_received(
+        self,
+        order_number: str,
+        sub_order_number: str = "",
+    ) -> None:
+        """Record that an order was received from Accio."""
+        with self._lock:
+            key = f"{order_number}:{sub_order_number}"
+            self._orders[key] = {
+                "order_number": order_number,
+                "sub_order_number": sub_order_number,
+                "status": self.RECEIVED,
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "processing_at": None,
+                "lookup_complete_at": None,
+                "posting_at": None,
+                "completed_at": None,
+                "disposition": None,
+                "certification_status": None,
+                "push_success": None,
+                "duration_ms": None,
+                "error": None,
+            }
+            self._order_list.append(key)
+            self._counters["total_received"] += 1
+            # Evict oldest entries if over limit
+            while len(self._order_list) > self._max_history:
+                old_key = self._order_list.pop(0)
+                self._orders.pop(old_key, None)
+
+    def update_status(
+        self,
+        order_number: str,
+        sub_order_number: str,
+        status: str,
+        **kwargs: Any,
+    ) -> None:
+        """Update an order's status and optional metadata fields."""
+        with self._lock:
+            key = f"{order_number}:{sub_order_number}"
+            if key not in self._orders:
+                return
+            entry = self._orders[key]
+            entry["status"] = status
+
+            # Record timestamps for each stage
+            ts_field = f"{status}_at"
+            if ts_field in entry and entry[ts_field] is None:
+                entry[ts_field] = datetime.now(timezone.utc).isoformat()
+
+            # Update any extra fields (disposition, duration_ms, etc.)
+            for k, v in kwargs.items():
+                if k in entry:
+                    entry[k] = v
+
+            # Update counters
+            if status == self.COMPLETED:
+                self._counters["total_completed"] += 1
+            elif status == self.FAILED:
+                self._counters["total_failed"] += 1
+
+    def get_all_orders(self) -> list[dict[str, Any]]:
+        """Return all tracked orders (newest first). Zero PII."""
+        with self._lock:
+            return [
+                dict(self._orders[key])
+                for key in reversed(self._order_list)
+                if key in self._orders
+            ]
+
+    def get_summary(self) -> dict[str, Any]:
+        """Return aggregate counters and recent activity. Zero PII."""
+        with self._lock:
+            recent = []
+            for key in reversed(self._order_list[-10:]):
+                if key in self._orders:
+                    recent.append(dict(self._orders[key]))
+            return {
+                "counters": dict(self._counters),
+                "in_memory_count": len(self._orders),
+                "recent_orders": recent,
+            }
+
+
+# Global tracker instance (shared across webhook and orchestrator)
+order_tracker = OrderTracker()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 2: SECURE MEMORY HANDLING  (the SSN fortress)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -915,6 +1046,11 @@ class CNAVerificationOrchestrator:
         }
 
         try:
+            # ── Track: processing ──
+            order_tracker.update_status(
+                order_number, sub_order_number, OrderTracker.PROCESSING
+            )
+
             with SecureSSN(raw_ssn) as ssn_holder:
                 # Zero the input immediately
                 _secure_zero_string(raw_ssn)
@@ -924,6 +1060,20 @@ class CNAVerificationOrchestrator:
                     ssn_holder, order_number
                 )
                 # SSN destroyed here
+
+            # ── Track: lookup complete ──
+            order_tracker.update_status(
+                order_number, sub_order_number,
+                OrderTracker.LOOKUP_COMPLETE,
+                disposition=result.status.value,
+                certification_status=result.status.value,
+                duration_ms=metrics.duration_ms,
+            )
+
+            # ── Track: posting results ──
+            order_tracker.update_status(
+                order_number, sub_order_number, OrderTracker.POSTING_RESULTS
+            )
 
             # Push to Accio
             push_ok = await self._accio.post_verification_result(
@@ -1048,6 +1198,9 @@ def create_app() -> "FastAPI":
         del body
         gc.collect()
 
+        # ── Track: order received ──
+        order_tracker.record_received(order_number, sub_order_number)
+
         # ── Process the lookup ──
         result = await orchestrator.process_single_order(
             order_number, raw_ssn, sub_order_number
@@ -1058,8 +1211,19 @@ def create_app() -> "FastAPI":
         del raw_ssn
         gc.collect()
 
-        # ── Return XML acknowledgment to Accio ──
+        # ── Track: final status ──
         success = result.get("success", False)
+        order_tracker.update_status(
+            order_number, sub_order_number,
+            OrderTracker.COMPLETED if success else OrderTracker.FAILED,
+            disposition=result.get("status"),
+            certification_status=result.get("status"),
+            push_success=result.get("push_success"),
+            duration_ms=result.get("duration_ms"),
+            error=result.get("error"),
+        )
+
+        # ── Return XML acknowledgment to Accio ──
         return _xml_ack_response(order_number, sub_order_number, success)
 
     @app.post("/webhook/accio/batch-verify")
@@ -1267,6 +1431,155 @@ def create_app() -> "FastAPI":
     <p>Last checked: {now}</p>
     <p style="margin-top:0.35rem;">LA CNA Registry Verification Bridge v1.0.0</p>
   </div>
+</body>
+</html>"""
+        return HTMLResponse(content=html, status_code=200)
+
+    @app.get("/orders/json")
+    async def orders_json() -> JSONResponse:
+        """Return all tracked orders as JSON. Zero PII."""
+        return JSONResponse(content=order_tracker.get_summary(), status_code=200)
+
+    @app.get("/orders", response_class=HTMLResponse)
+    async def orders_dashboard() -> HTMLResponse:
+        """Order tracking dashboard — displays NO PII."""
+        now = datetime.now(timezone.utc).strftime("%B %d, %Y at %I:%M %p UTC")
+        summary = order_tracker.get_summary()
+        counters = summary["counters"]
+        orders = order_tracker.get_all_orders()
+
+        # Build table rows
+        rows_html = ""
+        if not orders:
+            rows_html = (
+                '<tr><td colspan="7" style="text-align:center;'
+                'color:#94a3b8;padding:2rem;">No orders tracked yet. '
+                'Orders appear here when Accio dispatches to the bridge.'
+                '</td></tr>'
+            )
+        else:
+            for o in orders:
+                status = o.get("status", "unknown")
+                # Color-code status
+                if status == "completed":
+                    badge_color = "#10b981"
+                elif status == "failed":
+                    badge_color = "#ef4444"
+                elif status in ("processing", "lookup_complete", "posting_results"):
+                    badge_color = "#f59e0b"
+                else:
+                    badge_color = "#6b7280"
+
+                disp = o.get("disposition") or "—"
+                disp_color = "#10b981" if disp in ("Verified", "certified") else (
+                    "#ef4444" if disp in ("Unable to Verify", "not_certified") else (
+                        "#f59e0b" if disp in ("No Match", "not_found", "See Comments") else "#94a3b8"
+                    )
+                )
+
+                received = (o.get("received_at") or "")[:19].replace("T", " ")
+                completed = (o.get("completed_at") or "")[:19].replace("T", " ")
+                duration = o.get("duration_ms")
+                dur_str = f"{duration}ms" if duration else "—"
+                push = o.get("push_success")
+                push_str = "Yes" if push is True else ("No" if push is False else "—")
+                push_color = "#10b981" if push is True else (
+                    "#ef4444" if push is False else "#94a3b8"
+                )
+                err = o.get("error") or ""
+
+                rows_html += (
+                    f'<tr>'
+                    f'<td>{_xml_escape(o.get("order_number", ""))}</td>'
+                    f'<td>{_xml_escape(o.get("sub_order_number", ""))}</td>'
+                    f'<td><span style="background:{badge_color};color:#fff;'
+                    f'padding:2px 8px;border-radius:4px;font-size:0.8rem;">'
+                    f'{_xml_escape(status)}</span></td>'
+                    f'<td style="color:{disp_color};">{_xml_escape(disp)}</td>'
+                    f'<td style="color:{push_color};">{push_str}</td>'
+                    f'<td>{dur_str}</td>'
+                    f'<td style="font-size:0.8rem;color:#94a3b8;">'
+                    f'{received}</td>'
+                    f'</tr>'
+                )
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Order Tracker — LA CNA Bridge</title>
+<meta http-equiv="refresh" content="10">
+<style>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+         background:#0f172a; color:#e2e8f0; padding:1.5rem; }}
+  h1 {{ text-align:center; font-size:1.6rem; margin-bottom:0.3rem; }}
+  .subtitle {{ text-align:center; color:#94a3b8; font-size:0.9rem; margin-bottom:1.5rem; }}
+  .counters {{ display:flex; justify-content:center; gap:2rem; margin-bottom:1.5rem; flex-wrap:wrap; }}
+  .counter {{ background:#1e293b; border:1px solid #334155; border-radius:8px;
+              padding:1rem 1.5rem; text-align:center; min-width:140px; }}
+  .counter .num {{ font-size:2rem; font-weight:700; }}
+  .counter .lbl {{ font-size:0.8rem; color:#94a3b8; margin-top:0.2rem; }}
+  .num-received {{ color:#3b82f6; }}
+  .num-completed {{ color:#10b981; }}
+  .num-failed {{ color:#ef4444; }}
+  table {{ width:100%; border-collapse:collapse; background:#1e293b;
+           border:1px solid #334155; border-radius:8px; overflow:hidden; }}
+  th {{ background:#334155; padding:0.7rem; text-align:left; font-size:0.85rem;
+        color:#94a3b8; text-transform:uppercase; letter-spacing:0.05em; }}
+  td {{ padding:0.6rem 0.7rem; border-bottom:1px solid #1e293b; font-size:0.9rem; }}
+  tr:hover {{ background:#334155; }}
+  .refresh {{ text-align:center; color:#64748b; font-size:0.75rem; margin-top:1rem; }}
+  a {{ color:#3b82f6; text-decoration:none; }}
+  a:hover {{ text-decoration:underline; }}
+  .nav {{ text-align:center; margin-bottom:1rem; }}
+</style>
+</head>
+<body>
+  <div class="nav"><a href="/">&larr; Dashboard</a> &nbsp;|&nbsp;
+  <a href="/orders/json">JSON API</a></div>
+  <h1>Order Tracker</h1>
+  <p class="subtitle">Zero-PII order lifecycle tracking &mdash; auto-refreshes every 10s</p>
+
+  <div class="counters">
+    <div class="counter">
+      <div class="num num-received">{counters.get("total_received", 0)}</div>
+      <div class="lbl">Total Received</div>
+    </div>
+    <div class="counter">
+      <div class="num num-completed">{counters.get("total_completed", 0)}</div>
+      <div class="lbl">Completed</div>
+    </div>
+    <div class="counter">
+      <div class="num num-failed">{counters.get("total_failed", 0)}</div>
+      <div class="lbl">Failed</div>
+    </div>
+    <div class="counter">
+      <div class="num" style="color:#f59e0b;">{summary.get("in_memory_count", 0)}</div>
+      <div class="lbl">In Memory</div>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Order #</th>
+        <th>SubOrder #</th>
+        <th>Status</th>
+        <th>Disposition</th>
+        <th>Pushed to Accio</th>
+        <th>Duration</th>
+        <th>Received At (UTC)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {rows_html}
+    </tbody>
+  </table>
+
+  <p class="refresh">Last refreshed: {now} &mdash; Showing {len(orders)} orders
+  (max 500 in memory)</p>
 </body>
 </html>"""
         return HTMLResponse(content=html, status_code=200)
