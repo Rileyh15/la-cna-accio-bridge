@@ -1636,26 +1636,37 @@ def _xml_ack_response(
     Accio requires an <order> node in the response to confirm the vendor
     accepted the order. Without it, Accio shows:
     "The response document has no order node to indicate fulfillment."
+    IMPORTANT: Do NOT include an <error> node on success — Accio interprets
+    the presence of ANY <error> element as a failure, even with errorcode=0.
+    Only include <error> when there is an actual error.
     """
     from fastapi import Response as _Resp
-    error_code = "0" if success else "1"
-    error_text = "" if success else "Processing error"
     suborder_node = (
         f'<suborder number="{_xml_escape(sub_order_number)}"/>'
         if sub_order_number else ""
     )
-    xml_body = (
-        f"<?xml version='1.0' encoding='UTF-8'?>"
-        f"<XML>"
-        f"<order number=\"{_xml_escape(order_number)}\">"
-        f"<error>"
-        f"<errorcode>{error_code}</errorcode>"
-        f"<errortext>{_xml_escape(error_text)}</errortext>"
-        f"</error>"
-        f"{suborder_node}"
-        f"</order>"
-        f"</XML>"
-    )
+    if success:
+        xml_body = (
+            f"<?xml version='1.0' encoding='UTF-8'?>"
+            f"<XML>"
+            f"<order number=\"{_xml_escape(order_number)}\">"
+            f"{suborder_node}"
+            f"</order>"
+            f"</XML>"
+        )
+    else:
+        xml_body = (
+            f"<?xml version='1.0' encoding='UTF-8'?>"
+            f"<XML>"
+            f"<order number=\"{_xml_escape(order_number)}\">"
+            f"<error>"
+            f"<errorcode>1</errorcode>"
+            f"<errortext>Processing error</errortext>"
+            f"</error>"
+            f"{suborder_node}"
+            f"</order>"
+            f"</XML>"
+        )
     return _Resp(content=xml_body, media_type="text/xml", status_code=200)
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 9: CLI ENTRY POINT (for batch/cron mode)
