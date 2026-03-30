@@ -728,19 +728,19 @@ class AccioDataClient:
         # filledCode = specific disposition (second box in Accio)
         if result.status == CertificationStatus.CERTIFIED:
             disposition = "filled"
-            filled_code = "complete"
+            filled_code = "cd_Complete"
         elif result.status == CertificationStatus.NOT_CERTIFIED:
             disposition = "filled"
-            filled_code = "complete"
+            filled_code = "cd_Complete"
         elif result.status == CertificationStatus.CALL_REGISTRY:
             disposition = "filled"
-            filled_code = "complete"
+            filled_code = "cd_Complete"
         elif result.status == CertificationStatus.NOT_FOUND:
             disposition = "filled"
-            filled_code = "complete"
+            filled_code = "cd_Complete"
         else:
             disposition = "filled"
-            filled_code = "complete"
+            filled_code = "cd_Complete"
         # Format the search timestamp in Central Time (Louisiana)
         _CT = ZoneInfo("America/Chicago")
         try:
