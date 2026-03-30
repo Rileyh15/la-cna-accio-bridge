@@ -727,19 +727,19 @@ class AccioDataClient:
         # filledCode = more specific code for the postResults attribute
         if result.status == CertificationStatus.CERTIFIED:
             disposition = "filled"
-            filled_code = "clear"
+            filled_code = "cd_Complete"
         elif result.status == CertificationStatus.NOT_CERTIFIED:
             disposition = "filled"
-            filled_code = "hits"
+            filled_code = "cd_Complete"
         elif result.status == CertificationStatus.CALL_REGISTRY:
             disposition = "filled"
-            filled_code = "see comments"
+            filled_code = "cd_Complete"
         elif result.status == CertificationStatus.NOT_FOUND:
             disposition = "filled"
-            filled_code = "see comments"
+            filled_code = "cd_Complete"
         else:
             disposition = "filled"
-            filled_code = "see comments"
+            filled_code = "cd_Complete"
         # Build verified item fields
         verified_items = (
             f"<verifieditem>"
