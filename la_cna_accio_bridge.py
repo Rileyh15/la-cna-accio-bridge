@@ -37,6 +37,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from zoneinfo import ZoneInfo
 from typing import Any, Optional
 
 import httpx
@@ -857,51 +858,83 @@ class AccioDataClient:
         component within the order.
         """
         # Map our status to Accio disposition values
-        # filledStatus = high-level status for the postResults attribute
-        # filledCode = more specific code for the postResults attribute
+        # filledStatus = high-level status (first box in Accio)
+        # filledCode = specific disposition (second box in Accio)
         if result.status == CertificationStatus.CERTIFIED:
-            disposition = "filled"
-            filled_code = "clear"
+            disposition = "complete"
+            filled_code = "complete"
         elif result.status == CertificationStatus.NOT_CERTIFIED:
-            disposition = "filled"
-            filled_code = "hits"
+            disposition = "complete"
+            filled_code = "complete"
         elif result.status == CertificationStatus.CALL_REGISTRY:
-            disposition = "filled"
-            filled_code = "see comments"
+            disposition = "complete"
+            filled_code = "complete"
         elif result.status == CertificationStatus.NOT_FOUND:
-            disposition = "filled"
-            filled_code = "see comments"
+            disposition = "complete"
+            filled_code = "No listing"
         else:
-            disposition = "filled"
+            disposition = "complete"
             filled_code = "see comments"
 
-        # Build verified item fields
+        # Format the search timestamp in Central Time (Louisiana)
+        _CT = ZoneInfo("America/Chicago")
+        try:
+            _ts = datetime.fromisoformat(result.lookup_timestamp)
+            if _ts.tzinfo is None:
+                _ts = _ts.replace(tzinfo=timezone.utc)
+            _ts_ct = _ts.astimezone(_CT)
+            _searched_display = _ts_ct.strftime("%m/%d/%Y at %I:%M %p CT")
+        except (ValueError, TypeError):
+            _searched_display = result.lookup_timestamp
+
+        # Build verified item fields — only include fields that have values
+        # so "Not Found" results don't show a grid of blank rows in Accio
         verified_items = (
             f"<verifieditem>"
             f"<fieldname>CNA Certification Status</fieldname>"
             f"<fieldvalue>{_xml_escape(result.status.value)}</fieldvalue>"
             f"</verifieditem>"
-            f"<verifieditem>"
-            f"<fieldname>Certification Number</fieldname>"
-            f"<fieldvalue>{_xml_escape(result.certification_number)}</fieldvalue>"
-            f"</verifieditem>"
-            f"<verifieditem>"
-            f"<fieldname>Certified From</fieldname>"
-            f"<fieldvalue>{_xml_escape(result.certified_from)}</fieldvalue>"
-            f"</verifieditem>"
-            f"<verifieditem>"
-            f"<fieldname>Certified To</fieldname>"
-            f"<fieldvalue>{_xml_escape(result.certified_to)}</fieldvalue>"
-            f"</verifieditem>"
-            f"<verifieditem>"
-            f"<fieldname>Original Certification Date</fieldname>"
-            f"<fieldvalue>{_xml_escape(result.original_certification_date)}</fieldvalue>"
-            f"</verifieditem>"
-            f"<verifieditem>"
-            f"<fieldname>Registry Name</fieldname>"
-            f"<fieldvalue>{_xml_escape(result.name)}</fieldvalue>"
-            f"</verifieditem>"
         )
+
+        if result.name:
+            verified_items += (
+                f"<verifieditem>"
+                f"<fieldname>Registry Name</fieldname>"
+                f"<fieldvalue>{_xml_escape(result.name)}</fieldvalue>"
+                f"</verifieditem>"
+            )
+
+        if result.certification_number:
+            verified_items += (
+                f"<verifieditem>"
+                f"<fieldname>Certification Number</fieldname>"
+                f"<fieldvalue>{_xml_escape(result.certification_number)}</fieldvalue>"
+                f"</verifieditem>"
+            )
+
+        if result.certified_from:
+            verified_items += (
+                f"<verifieditem>"
+                f"<fieldname>Certified From</fieldname>"
+                f"<fieldvalue>{_xml_escape(result.certified_from)}</fieldvalue>"
+                f"</verifieditem>"
+            )
+
+        if result.certified_to:
+            verified_items += (
+                f"<verifieditem>"
+                f"<fieldname>Certified To</fieldname>"
+                f"<fieldvalue>{_xml_escape(result.certified_to)}</fieldvalue>"
+                f"</verifieditem>"
+            )
+
+        if result.original_certification_date:
+            verified_items += (
+                f"<verifieditem>"
+                f"<fieldname>Original Certification Date</fieldname>"
+                f"<fieldvalue>{_xml_escape(result.original_certification_date)}</fieldvalue>"
+                f"</verifieditem>"
+            )
 
         if result.retest_required_by:
             verified_items += (
@@ -919,19 +952,72 @@ class AccioDataClient:
                 f"</verifieditem>"
             )
 
-        # Build the note text with all verification details
-        note_parts = [
-            f"CNA Status: {result.status.value}",
-            f"Name: {result.name}" if result.name else None,
-            f"Cert #: {result.certification_number}" if result.certification_number else None,
-            f"Certified From: {result.certified_from}" if result.certified_from else None,
-            f"Certified To: {result.certified_to}" if result.certified_to else None,
-            f"Original Cert Date: {result.original_certification_date}" if result.original_certification_date else None,
-            f"Retest Required By: {result.retest_required_by}" if result.retest_required_by else None,
-            f"Multiple Matches: Yes ({result.match_count} records)" if result.multiple_matches else None,
-            f"Lookup completed {result.lookup_timestamp}",
-        ]
-        note_text = "; ".join(p for p in note_parts if p)
+        # Always include the search timestamp as a verified item
+        verified_items += (
+            f"<verifieditem>"
+            f"<fieldname>Search Date</fieldname>"
+            f"<fieldvalue>{_xml_escape(_searched_display)}</fieldvalue>"
+            f"</verifieditem>"
+        )
+
+        # Build professionally formatted note text for Accio reviewers
+        if result.status == CertificationStatus.NOT_FOUND:
+            # ── Clean "No Listing" format ──
+            note_text = (
+                "═══ LA CNA REGISTRY — NO LISTING FOUND ═══\n"
+                "\n"
+                "No matching CNA certification record was\n"
+                "found in the Louisiana Nurse Aide Registry\n"
+                "for the submitted SSN.\n"
+                "\n"
+                f"Searched: {_searched_display}"
+            )
+        elif result.status == CertificationStatus.CALL_REGISTRY:
+            # ── "Call Registry" — action required ──
+            lines = [
+                "═══ LA CNA REGISTRY — ACTION REQUIRED ═══",
+                "",
+                'The registry returned a "Call CNA Registry"',
+                "status. Manual verification is required.",
+                "",
+                "Contact: Louisiana CNA Registry",
+                "Phone:   (225) 342-0138",
+            ]
+            if result.name:
+                lines += ["", f"Registry Name:     {result.name}"]
+            if result.certification_number:
+                lines.append(f"Cert #:            {result.certification_number}")
+            lines += ["", f"Searched: {_searched_display}"]
+            note_text = "\n".join(lines)
+        else:
+            # ── Match found (Certified / Not Certified / other) ──
+            status_prefix = ""
+            if result.status == CertificationStatus.NOT_CERTIFIED:
+                header = "═══ LA CNA REGISTRY — MATCH FOUND ═══"
+                status_prefix = "⚠ "
+            elif result.status == CertificationStatus.CERTIFIED:
+                header = "═══ LA CNA REGISTRY — MATCH FOUND ═══"
+            else:
+                header = "═══ LA CNA REGISTRY — MATCH FOUND ═══"
+
+            lines = [header, ""]
+            lines.append(f"{status_prefix}Status:            {result.status.value}")
+            if result.name:
+                lines.append(f"Registry Name:     {result.name}")
+            if result.certification_number:
+                lines.append(f"Cert #:            {result.certification_number}")
+            if result.certified_from:
+                lines.append(f"Certified From:    {result.certified_from}")
+            if result.certified_to:
+                lines.append(f"Certified To:      {result.certified_to}")
+            if result.original_certification_date:
+                lines.append(f"Original Cert:     {result.original_certification_date}")
+            if result.retest_required_by:
+                lines.append(f"Retest Required:   {result.retest_required_by}")
+            if result.multiple_matches:
+                lines.append(f"Multiple Matches:  Yes ({result.match_count} records)")
+            lines += ["", f"Searched: {_searched_display}"]
+            note_text = "\n".join(lines)
 
         # Accio requires <ScreeningResults> as root with <mode>, <login>,
         # <registration> as siblings of <postResults> (NOT inside it).
