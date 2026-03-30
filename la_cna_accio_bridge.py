@@ -774,13 +774,6 @@ class AccioDataClient:
                 f"<fieldvalue>{_xml_escape(result.retest_required_by)}</fieldvalue>"
                 f"</verifieditem>"
             )
-        if result.multiple_matches:
-            verified_items += (
-                f"<verifieditem>"
-                f"<fieldname>Multiple Matches</fieldname>"
-                f"<fieldvalue>Yes ({result.match_count} records)</fieldvalue>"
-                f"</verifieditem>"
-            )
         # Format the search timestamp in Central Time (Louisiana)
         from zoneinfo import ZoneInfo
         _CT = ZoneInfo("America/Chicago")
@@ -839,8 +832,6 @@ class AccioDataClient:
                 _retest_note = result.retest_required_by.replace("\xa0", "").replace("&nbsp;", "").strip()
                 if _retest_note:
                     lines.append(f"Retest Required:   {_retest_note}")
-            if result.multiple_matches:
-                lines.append(f"Multiple Matches:  Yes ({result.match_count} records)")
             lines += ["", f"Searched: {_searched_display}"]
             note_text = "\n".join(lines)
         # Accio requires <ScreeningResults> as root with <mode>, <login>,
