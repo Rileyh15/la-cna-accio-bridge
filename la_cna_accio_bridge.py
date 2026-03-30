@@ -861,19 +861,19 @@ class AccioDataClient:
         # filledStatus = high-level status (first box in Accio)
         # filledCode = specific disposition (second box in Accio)
         if result.status == CertificationStatus.CERTIFIED:
-            disposition = "complete"
+            disposition = "filled"
             filled_code = "complete"
         elif result.status == CertificationStatus.NOT_CERTIFIED:
-            disposition = "complete"
+            disposition = "filled"
             filled_code = "complete"
         elif result.status == CertificationStatus.CALL_REGISTRY:
-            disposition = "complete"
+            disposition = "filled"
             filled_code = "complete"
         elif result.status == CertificationStatus.NOT_FOUND:
-            disposition = "complete"
+            disposition = "filled"
             filled_code = "No listing"
         else:
-            disposition = "complete"
+            disposition = "filled"
             filled_code = "see comments"
 
         # Format the search timestamp in Central Time (Louisiana)
@@ -1008,7 +1008,7 @@ class AccioDataClient:
                 lines.append(f"Cert #:            {result.certification_number}")
             if result.certified_from:
                 lines.append(f"Certified From:    {result.certified_from}")
-            if result.certified_to:
+            if result.certified_toh:
                 lines.append(f"Certified To:      {result.certified_to}")
             if result.original_certification_date:
                 lines.append(f"Original Cert:     {result.original_certification_date}")
