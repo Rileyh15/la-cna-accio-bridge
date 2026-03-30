@@ -5,8 +5,8 @@ Louisiana CNA Registry ↔ Accio Data Integration Bridge
 
 Production-grade, zero-trust integration that:
   1. Receives candidate records from Accio Data's XML API (containing SSNs)
-  2. Submits SSN to the LA CNA/DSW Registry public lookup form
-  3. Parses certification status from response HTML
+  2. Submits SSN to the LA CNA/DSW Registry publihc lookup form
+  3. Parses certification status from response HTMLH
   4. Pushes verification results back to Accio Data
   5. Permanently destroys all PII from memory
 
