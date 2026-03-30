@@ -714,7 +714,8 @@ class AccioDataClient:
             pass  # Logged as operational failure below
         return orders
     async def post_verification_result(
-        self, order_number: str, result: CNAResult, sub_order_number: str = ""
+        self, order_number: str, result: CNAResult, sub_order_number: str = "",
+        sub_order_type: str = "cna_registry",
     ) -> bool:
         """
         Push CNA verification result back to Accio Data as a completed
@@ -794,11 +795,13 @@ class AccioDataClient:
                 f"<fieldvalue>{_xml_escape(result.original_certification_date)}</fieldvalue>"
                 f"</verifieditem>"
             )
-        if result.retest_required_by:
+        # Filter out &nbsp; and whitespace-only values from retest field
+        _retest = result.retest_required_by.replace("\xa0", "").replace("&nbsp;", "").strip()
+        if _retest:
             verified_items += (
                 f"<verifieditem>"
                 f"<fieldname>Retest Required By</fieldname>"
-                f"<fieldvalue>{_xml_escape(result.retest_required_by)}</fieldvalue>"
+                f"<fieldvalue>{_xml_escape(_retest)}</fieldvalue>"
                 f"</verifieditem>"
             )
         if result.multiple_matches:
@@ -819,7 +822,7 @@ class AccioDataClient:
         if result.status == CertificationStatus.NOT_FOUND:
             # ── Clean "No Listing" format ──
             note_text = (
-                "═══ LA CNA REGISTRY — NO LISTING FOUND ═══\n"
+                "=== LA CNA REGISTRY - NO LISTING FOUND ===\n"
                 "\n"
                 "No matching CNA certification record was\n"
                 "found in the Louisiana Nurse Aide Registry\n"
@@ -830,7 +833,7 @@ class AccioDataClient:
         elif result.status == CertificationStatus.CALL_REGISTRY:
             # ── "Call Registry" — action required ──
             lines = [
-                "═══ LA CNA REGISTRY — ACTION REQUIRED ═══",
+                "=== LA CNA REGISTRY - ACTION REQUIRED ===",
                 "",
                 'The registry returned a "Call CNA Registry"',
                 "status. Manual verification is required.",
@@ -848,12 +851,12 @@ class AccioDataClient:
             # ── Match found (Certified / Not Certified / other) ──
             status_prefix = ""
             if result.status == CertificationStatus.NOT_CERTIFIED:
-                header = "═══ LA CNA REGISTRY — MATCH FOUND ═══"
-                status_prefix = "⚠ "
+                header = "=== LA CNA REGISTRY - MATCH FOUND ==="
+                status_prefix = "[!] "
             elif result.status == CertificationStatus.CERTIFIED:
-                header = "═══ LA CNA REGISTRY — MATCH FOUND ═══"
+                header = "=== LA CNA REGISTRY - MATCH FOUND ==="
             else:
-                header = "═══ LA CNA REGISTRY — MATCH FOUND ═══"
+                header = "=== LA CNA REGISTRY - MATCH FOUND ==="
             lines = [header, ""]
             lines.append(f"{status_prefix}Status:            {result.status.value}")
             if result.name:
@@ -866,8 +869,9 @@ class AccioDataClient:
                 lines.append(f"Certified To:      {result.certified_to}")
             if result.original_certification_date:
                 lines.append(f"Original Cert:     {result.original_certification_date}")
-            if result.retest_required_by:
-                lines.append(f"Retest Required:   {result.retest_required_by}")
+            _retest_note = result.retest_required_by.replace("\xa0", "").replace("&nbsp;", "").strip()
+            if _retest_note:
+                lines.append(f"Retest Required:   {_retest_note}")
             if result.multiple_matches:
                 lines.append(f"Multiple Matches:  Yes ({result.match_count} records)")
             lines += ["", f"Searched: {_searched_display}"]
@@ -884,7 +888,7 @@ class AccioDataClient:
             f"{self._build_registration_xml()}"
             f"<postResults order=\"{_xml_escape(order_number)}\""
             f" subOrder=\"{_xml_escape(sub_order_number)}\""
-            f" type=\"Certified Nurse Aid Registry\""
+            f" type=\"{_xml_escape(sub_order_type)}\""
             f" filledStatus=\"{_xml_escape(disposition)}\""
             f" filledCode=\"{_xml_escape(filled_code)}\">"
             f"<notes_from_vendor_to_screeningfirm>"
@@ -909,6 +913,13 @@ class AccioDataClient:
                     content=request_xml,
                     headers={"Content-Type": "text/xml"},
                 )
+            # Build a sanitized version of the request XML for debugging
+            # (strip credentials but keep everything else)
+            _safe_xml = re.sub(
+                r"<(account|username|password)>[^<]*</\1>",
+                r"<\1>***</\1>",
+                request_xml,
+            )
             # Log the response for debugging (no PII in PostResults response)
             log_entry: dict[str, Any] = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -917,6 +928,7 @@ class AccioDataClient:
                 "url": postresults_url,
                 "http_status": response.status_code,
                 "response_body": response.text[:1500],
+                "request_xml": _safe_xml[:3000],
                 "disposition": disposition,
                 "filled_code": filled_code,
                 "cna_status": result.status.value,
@@ -1078,7 +1090,8 @@ class CNAVerificationOrchestrator:
         summary["completed_at"] = datetime.now(timezone.utc).isoformat()
         return summary
     async def process_single_order(
-        self, order_number: str, raw_ssn: str, sub_order_number: str = ""
+        self, order_number: str, raw_ssn: str, sub_order_number: str = "",
+        sub_order_type: str = "cna_registry",
     ) -> dict[str, Any]:
         """
         Process a single order (e.g., triggered by webhook).
@@ -1118,7 +1131,7 @@ class CNAVerificationOrchestrator:
             )
             # Push to Accio
             push_ok = await self._accio.post_verification_result(
-                order_number, result, sub_order_number
+                order_number, result, sub_order_number, sub_order_type
             )
             response.update({
                 "success": metrics.success,
@@ -1198,6 +1211,8 @@ def create_app() -> "FastAPI":
         order_number = place_order.get("number", "").strip()
         sub_order = place_order.find("subOrder")
         sub_order_number = sub_order.get("number", "").strip() if sub_order is not None else ""
+        # Capture the search type from dispatch — PostResults type MUST match exactly
+        sub_order_type = sub_order.get("type", "cna_registry").strip() if sub_order is not None else "cna_registry"
         # ── Extract SSN from subject (SSN enters memory here) ──
         subject = place_order.find("subject")
         if subject is None:
@@ -1217,7 +1232,7 @@ def create_app() -> "FastAPI":
         order_tracker.record_received(order_number, sub_order_number)
         # ── Process the lookup ──
         result = await orchestrator.process_single_order(
-            order_number, raw_ssn, sub_order_number
+            order_number, raw_ssn, sub_order_number, sub_order_type
         )
         # Zero raw_ssn one more time (belt and suspenders)
         _secure_zero_string(raw_ssn)
