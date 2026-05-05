@@ -722,6 +722,20 @@ class AccioDataClient:
         The sub_order_number ties the result to the specific search
         component within the order.
         """
+        # ── HOLD on LOOKUP_ERROR or CALL_REGISTRY — do NOT post to Accio ──
+        # LOOKUP_ERROR is an infra failure (registry unreachable / parse error)
+        # that must never appear on the client report.
+        # CALL_REGISTRY requires manual operator follow-up — posting it would
+        # send an incomplete, unverified result to the client.
+        # Both are held in-flight for operator retry.
+        _HELD_STATUSES = (CertificationStatus.LOOKUP_ERROR, CertificationStatus.CALL_REGISTRY)
+        if result.status in _HELD_STATUSES:
+            print(
+                f"[PostResults] HELD {result.status.value} order={order_number} "
+                f"sub={sub_order_number} — NOT posting to Accio."
+            )
+            return False
+
         # Map our status to Accio disposition values
         # filledStatus = high-level status for the postResults attribute
         # filledCode = more specific code for the postResults attribute
